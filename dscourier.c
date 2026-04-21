@@ -61,6 +61,10 @@
 #define HR_RPC_E_CHANGED_MODE            ((HRESULT)0x80010106L)
 #define HR_RPC_E_CALL_CANCELED           ((HRESULT)0x80010002L)
 #define HR_REGDB_E_CLASSNOTREG           ((HRESULT)0x80040154L)
+/* App Installer 1.19+ rejects CoCreateInstance from non-packaged callers.
+ * Fall back to RoGetActivationFactory (WinRT path) which has no such
+ * restriction and is designed for Win32 / non-packaged consumers. */
+#define HR_APPMODEL_NO_PACKAGE           ((HRESULT)0x80073D54L)
 
 /* ========================================================================= *
  *  DFR imports
@@ -93,6 +97,13 @@ DECLSPEC_IMPORT BOOL    WINAPI KERNEL32$CloseHandle(HANDLE);
 DECLSPEC_IMPORT LONG    WINAPI ADVAPI32$RegOpenKeyExW(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
 DECLSPEC_IMPORT LONG    WINAPI ADVAPI32$RegQueryValueExW(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
 DECLSPEC_IMPORT LONG    WINAPI ADVAPI32$RegCloseKey(HKEY);
+
+/* NtOpenKey: bypasses WOW64 registry redirection entirely.
+ * Used as a final fallback in probe_registry so an x86 BOF running on
+ * x64 Windows can still reach the 64-bit PackagedCom ClassIndex hive. */
+DECLSPEC_IMPORT LONG    NTAPI  NTDLL$NtOpenKey(PHANDLE, ACCESS_MASK, PVOID);
+DECLSPEC_IMPORT void    NTAPI  NTDLL$RtlInitUnicodeString(PVOID, PCWSTR);
+DECLSPEC_IMPORT LONG    NTAPI  NTDLL$NtClose(HANDLE);
 
 DECLSPEC_IMPORT int     WINAPIV USER32$wvsprintfA(LPSTR, LPCSTR, va_list);
 
@@ -208,6 +219,46 @@ static HRESULT probe_registry(WCHAR *server_path_out, DWORD cch_out) {
         trace("[T] registry: matched at try %u\n", i);
         return S_OK;
     }
+
+    /* NtOpenKey fallback: uses the kernel object namespace path, which is
+     * completely immune to WOW64 registry redirection.  An x86 BOF running
+     * inside a WOW64 process can reach the 64-bit hive this way even when
+     * RegOpenKeyExW + KEY_WOW64_64KEY is misbehaving in a hardened sandbox. */
+    {
+        /* Inline UNICODE_STRING / OBJECT_ATTRIBUTES to avoid winternl.h dep. */
+        struct { USHORT Len; USHORT MaxLen; PWSTR Buf; } ustr;
+        struct {
+            ULONG  Length;
+            HANDLE RootDirectory;
+            PVOID  ObjectName;
+            ULONG  Attributes;
+            PVOID  SecurityDescriptor;
+            PVOID  SecurityQualityOfService;
+        } oa;
+        static const WCHAR nt_path[] =
+            L"\\Registry\\Machine\\SOFTWARE\\Classes\\PackagedCom\\"
+            L"ClassIndex\\{73D763B7-2937-432F-A97A-D98A4A596126}";
+
+        NTDLL$RtlInitUnicodeString(&ustr, nt_path);
+
+        oa.Length                   = sizeof(oa);
+        oa.RootDirectory            = NULL;
+        oa.ObjectName               = &ustr;
+        oa.Attributes               = 0x40; /* OBJ_CASE_INSENSITIVE */
+        oa.SecurityDescriptor       = NULL;
+        oa.SecurityQualityOfService = NULL;
+
+        HANDLE hk = NULL;
+        LONG st = NTDLL$NtOpenKey(&hk, 0x20019 /* KEY_READ */, &oa);
+        if (st == 0) {
+            NTDLL$NtClose(hk);
+            trace("[T] registry: matched via NtOpenKey (WOW64 bypass)\n");
+            /* server_path_out stays empty — NtOpenKey path skips LocalServer32 */
+            return S_OK;
+        }
+        trace("[T] NtOpenKey: 0x%lX\n", st);
+    }
+
     return HR_REGDB_E_CLASSNOTREG;
 }
 
@@ -329,6 +380,23 @@ static HRESULT activate_statics_guarded(BOOL elevated, IConfigurationStatics **o
                                     DS_CLSCTX_LOCAL_SERVER,
                                     &IID_IConfigurationStatics, (void**)&stat);
         trace("[T] activate: CoCreateInstance -> 0x%08X\n", hr);
+
+        /* App Installer 1.19+ blocks non-packaged callers via Packaged COM
+         * (ERROR_APPMODEL_NO_PACKAGE).  WinRT factory activation uses a
+         * separate code path that does not enforce package identity. */
+        if (hr == HR_APPMODEL_NO_PACKAGE) {
+            HSTRING hs_class = NULL;
+            trace("[T] activate: CoCreateInstance -> NO_PACKAGE, retrying via RoGetActivationFactory\n");
+            HRESULT hh = hstring_from_wcstr(
+                L"Microsoft.Management.Configuration.ConfigurationStaticFunctions",
+                &hs_class);
+            if (SUCCEEDED(hh)) {
+                hr = COMBASE$RoGetActivationFactory(hs_class, &IID_IConfigurationStatics,
+                                                    (void**)&stat);
+                trace("[T] activate: RoGetActivationFactory -> 0x%08X\n", hr);
+                COMBASE$WindowsDeleteString(hs_class);
+            }
+        }
     }
 
     /* Tell watchdog to stand down. */
@@ -613,20 +681,24 @@ static int run_check(BOOL elevated) {
         return 0;
     }
 
-    /* Registry miss: the CLSID may live behind an AppX activation record that
-     * doesn't surface in any HKCR-visible path for us. Fall back to a real
-     * CoCreateInstance (guarded by the 30s watchdog + CoCancelCall), which is
-     * the only definitive signal. This will transiently spawn
-     * WindowsPackageManagerServer.exe on success - expected behaviour. */
+    /* Registry miss: fall back to a real CoCreateInstance (guarded by the
+     * 30s watchdog + CoCancelCall), which is the only definitive signal.
+     * This will transiently spawn WindowsPackageManagerServer.exe on success. */
     trace("[T] registry miss, falling back to guarded CoCreateInstance\n");
 
     IConfigurationStatics *stat = NULL;
-    BOOL inited_com = FALSE;
+    BOOL inited_com = FALSE, inited_ro = FALSE;
     HRESULT hc = OLE32$CoInitializeEx(NULL, DS_COINIT_MULTITHREADED);
     if (hc == S_OK || hc == S_FALSE) inited_com = TRUE;
 
+    /* RoInitialize is required for the RoGetActivationFactory fallback inside
+     * activate_statics_guarded (triggered when ERROR_APPMODEL_NO_PACKAGE). */
+    hc = COMBASE$RoInitialize(DS_RO_INIT_MULTITHREADED);
+    if (hc == S_OK || hc == S_FALSE) inited_ro = TRUE;
+
     hr = activate_statics_guarded(elevated, &stat);
     if (stat) { stat->lpVtbl->Release(stat); stat = NULL; }
+    if (inited_ro)  COMBASE$RoUninitialize();
     if (inited_com) OLE32$CoUninitialize();
 
     if (SUCCEEDED(hr)) {

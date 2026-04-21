@@ -53,6 +53,13 @@ sub _dsc_run {
     $bytes = _dsc_read($bof);
     if ($bytes is $null) { berror($bid, "dscourier: read failed: $bof"); return; }
 
+    # Warn when running an x86 beacon on a likely x64 target.
+    # probe_registry falls back to NtOpenKey so this should still succeed,
+    # but the message reminds the operator of the mismatch.
+    if (barch($bid) eq "x86") {
+        bwarning($bid, "dscourier: beacon is x86 - NtOpenKey fallback active for 64-bit registry access. Prefer an x64 beacon for full reliability.");
+    }
+
     $info = _dsc_flags(@argv);
     # bof_pack "iib": int mode, int flags, bin yaml
     $args = bof_pack($bid, "iib", $mode, $info["flags"], $yaml);
